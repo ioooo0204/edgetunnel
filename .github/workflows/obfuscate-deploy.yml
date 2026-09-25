@@ -1,0 +1,66 @@
+name: Obfuscate and Deploy
+# 套壳流水线：上游同步(main) → 混淆 _worker.js → 推到 deploy 分支 → Cloudflare 自动构建
+permissions:
+  contents: write
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "30 0 * * *"   # 每天 00:30 UTC，晚于上游 sync.yml 的 00:00，接力处理
+  push:
+    branches: [main]
+
+jobs:
+  obfuscate:
+    name: Obfuscate _worker.js and push to deploy branch
+    runs-on: ubuntu-latest
+    if: ${{ github.event.repository.fork }}
+    steps:
+      - name: Checkout main
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 1
+          ref: main
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Install javascript-obfuscator
+        run: npm install -g javascript-obfuscator --silent
+
+      - name: Obfuscate _worker.js
+        run: |
+          # 中等强度混淆：控制流扁平化 + 字符串数组化 + 死代码注入
+          # 不开 selfDefending / debugProtection，避免影响 Workers 运行时性能
+          npx javascript-obfuscator _worker.js \
+            --output _worker.js \
+            --compact true \
+            --control-flow-flattening true \
+            --control-flow-flattening-threshold 0.75 \
+            --string-array true \
+            --string-array-encoding rc4 \
+            --string-array-threshold 1 \
+            --string-array-rotate true \
+            --string-array-shuffle true \
+            --split-strings true \
+            --split-strings-chunk-length 8 \
+            --dead-code-injection true \
+            --dead-code-injection-threshold 0.4 \
+            --rename-globals false \
+            --self-defending false \
+            --debug-protection false \
+            --source-map false
+
+      - name: Prepare deploy branch
+        run: |
+          git config user.name "GH Action - Obfuscator"
+          git config user.email "action@github.com"
+          git checkout --orphan deploy
+          git rm -rf --cached . -q
+          git add _worker.js wrangler.toml
+          git commit -m "build: obfuscated worker from ${GITHUB_SHA::7}"
+
+      - name: Force push deploy branch
+        run: git push --force origin deploy
