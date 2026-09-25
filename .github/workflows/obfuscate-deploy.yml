@@ -6,6 +6,9 @@ name: Obfuscate and Deploy
 #   2) deploy 分支写入 edt2-worker 专用 wrangler.toml（名称 + KV 绑定 + keep_vars），
 #      否则用 Cloudflare Git 自动构建时会因名称不符失败或丢失 KV
 #   3) 混淆后先 node --check 语法校验，坏产物不推送
+#   4) 自动部署 job：上游源码有变化才部署 → 冒烟测试（伪装页/面板登录/订阅/真实代理连通）→ 失败自动回滚
+#      需要仓库 Secrets：CLOUDFLARE_API_TOKEN（没配置时整个部署 job 自动跳过，不报错）、CLOUDFLARE_ACCOUNT_ID、
+#      EDT2_HOST、EDT2_SUB_TOKEN、EDT2_ADMIN_PW
 permissions:
   contents: write
 
@@ -83,3 +86,84 @@ jobs:
 
       - name: Force push deploy branch
         run: git push --force origin deploy
+
+  deploy:
+    name: Deploy to Cloudflare (smoke test + auto rollback)
+    needs: obfuscate
+    runs-on: ubuntu-latest
+    if: ${{ github.event.repository.fork }}
+    env:
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+      H: ${{ secrets.EDT2_HOST }}
+      SUBTOK: ${{ secrets.EDT2_SUB_TOKEN }}
+      PW: ${{ secrets.EDT2_ADMIN_PW }}
+      WR: npx --yes wrangler@4
+    steps:
+      - name: Gate
+        id: gate
+        run: |
+          if [ -z "$CLOUDFLARE_API_TOKEN" ]; then echo "未配置 CLOUDFLARE_API_TOKEN，跳过自动部署"; echo "go=0" >> $GITHUB_OUTPUT; exit 0; fi
+          echo "go=1" >> $GITHUB_OUTPUT
+
+      - name: Checkout main (source hash)
+        if: steps.gate.outputs.go == '1'
+        uses: actions/checkout@v6
+        with: { ref: main, fetch-depth: 1, path: src }
+
+      - name: Checkout deploy branch
+        if: steps.gate.outputs.go == '1'
+        uses: actions/checkout@v6
+        with: { ref: deploy, fetch-depth: 1, path: dep }
+
+      - name: Setup Node
+        if: steps.gate.outputs.go == '1'
+        uses: actions/setup-node@v4
+        with: { node-version: "22" }
+
+      - name: Decide (skip if this source is already live)
+        if: steps.gate.outputs.go == '1'
+        id: dec
+        working-directory: dep
+        run: |
+          SRC=$(git -C ../src hash-object _worker.js | cut -c1-12)
+          echo "src=$SRC" >> $GITHUB_OUTPUT
+          $WR deployments status --json > st.json 2>/dev/null || true
+          PREV=$(node -e 'try{const d=JSON.parse(require("fs").readFileSync("st.json","utf8"));const v=(d.versions||[]).find(x=>x.percentage===100)||(d.versions||[])[0];process.stdout.write(v?(v.version_id||v.id||""):"")}catch(e){}')
+          MSG=$(node -e 'try{const d=JSON.parse(require("fs").readFileSync("st.json","utf8"));process.stdout.write((d.annotations&&d.annotations["workers/message"])||"")}catch(e){}')
+          rm -f st.json
+          echo "prev=$PREV" >> $GITHUB_OUTPUT
+          echo "当前线上版本: $PREV  说明: $MSG  本次源码: $SRC"
+          if [ -z "$PREV" ]; then echo "取不到当前版本（无法回滚），为安全起见不部署"; echo "go=0" >> $GITHUB_OUTPUT; exit 1; fi
+          if echo "$MSG" | grep -q "src $SRC"; then echo "该源码已在线上，跳过"; echo "go=0" >> $GITHUB_OUTPUT; else echo "go=1" >> $GITHUB_OUTPUT; fi
+
+      - name: Deploy
+        if: steps.dec.outputs.go == '1'
+        working-directory: dep
+        run: $WR deploy --message "ci src ${{ steps.dec.outputs.src }} (${GITHUB_SHA::7})"
+
+      - name: Smoke test
+        if: steps.dec.outputs.go == '1'
+        id: smoke
+        run: |
+          set -u; fail=0; sleep 20
+          ok(){ echo "ok   $1"; }; bad(){ echo "FAIL $1"; fail=$((fail+1)); }
+          c=$(curl -s -o /dev/null -w '%{http_code}' --max-time 15 "https://$H/"); [ "$c" = 200 ] && ok "伪装页 $c" || bad "伪装页 $c"
+          curl -s -c jar -o /dev/null --max-time 15 --data-urlencode "password=$PW" "https://$H/login"
+          curl -s -b jar --max-time 15 "https://$H/admin/config.json" | grep -qi uuid && ok "面板登录" || bad "面板登录"; rm -f jar
+          curl -s -A "v2rayN/7.0" --max-time 20 "https://$H/sub?token=$SUBTOK&target=mixed" | base64 -d 2>/dev/null > links.txt || true
+          n=$(grep -c '^vless://' links.txt || true); [ "$n" -ge 10 ] && ok "订阅 $n 条" || bad "订阅 $n 条"
+          URL=$(curl -s -H "Authorization: Bearer ${{ github.token }}" https://api.github.com/repos/MetaCubeX/mihomo/releases/latest | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{const a=JSON.parse(s).assets.find(x=>/^mihomo-linux-amd64-v[\d.]+\.gz$/.test(x.name));process.stdout.write(a?a.browser_download_url:"")})')
+          curl -sL "$URL" | gunzip > mihomo && chmod +x mihomo
+          { echo "mixed-port: 17897"; echo "log-level: warning"; echo "proxy-providers:"; echo "  m: {type: file, path: ./links.txt, health-check: {enable: false}}";
+            echo "proxy-groups:"; echo "  - {name: T, type: url-test, use: [m], url: 'https://www.gstatic.com/generate_204', interval: 600}"; echo "rules: [MATCH,T]"; } > c.yaml
+          ./mihomo -d . -f c.yaml > m.log 2>&1 & MP=$!; sleep 15
+          c=$(curl -s -x http://127.0.0.1:17897 -o /dev/null -w '%{http_code}' --max-time 20 https://www.gstatic.com/generate_204); [ "$c" = 204 ] && ok "代理连通 generate_204" || bad "代理连通 $c"
+          c=$(curl -s -x http://127.0.0.1:17897 --max-time 20 https://www.cloudflare.com/cdn-cgi/trace | grep -c '^loc=' || true); [ "$c" = 1 ] && ok "CF 站点经代理" || bad "CF 站点经代理"
+          kill $MP || true; rm -f links.txt mihomo c.yaml m.log cache.db
+          echo "失败项: $fail"; [ $fail -eq 0 ]
+
+      - name: Rollback on failure
+        if: failure() && steps.dec.outputs.go == '1' && steps.dec.outputs.prev != ''
+        working-directory: dep
+        run: $WR rollback "${{ steps.dec.outputs.prev }}" --name edt2-worker -y -m "ci smoke failed"
