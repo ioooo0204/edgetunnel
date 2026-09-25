@@ -32,7 +32,7 @@ jobs:
           ref: main
 
       - name: Setup Node
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v5
         with:
           node-version: "22"
 
@@ -118,7 +118,7 @@ jobs:
 
       - name: Setup Node
         if: steps.gate.outputs.go == '1'
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v5
         with: { node-version: "22" }
 
       - name: Decide (skip if this source is already live)
@@ -153,10 +153,10 @@ jobs:
           curl -s -b jar --max-time 15 "https://$H/admin/config.json" | grep -qi uuid && ok "面板登录" || bad "面板登录"; rm -f jar
           curl -s -A "v2rayN/7.0" --max-time 20 "https://$H/sub?token=$SUBTOK&target=mixed" | base64 -d 2>/dev/null > links.txt || true
           n=$(grep -c '^vless://' links.txt || true); [ "$n" -ge 10 ] && ok "订阅 $n 条" || bad "订阅 $n 条"
-          URL=$(curl -s -H "Authorization: Bearer ${{ github.token }}" https://api.github.com/repos/MetaCubeX/mihomo/releases/latest | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{const a=JSON.parse(s).assets.find(x=>/^mihomo-linux-amd64-v[\d.]+\.gz$/.test(x.name));process.stdout.write(a?a.browser_download_url:"")})')
+          URL=https://github.com/MetaCubeX/mihomo/releases/download/v1.19.31/mihomo-linux-amd64-v1.19.31.gz
           curl -sL "$URL" | gunzip > mihomo && chmod +x mihomo
           { echo "mixed-port: 17897"; echo "log-level: warning"; echo "proxy-providers:"; echo "  m: {type: file, path: ./links.txt, health-check: {enable: false}}";
-            echo "proxy-groups:"; echo "  - {name: T, type: url-test, use: [m], url: 'https://www.gstatic.com/generate_204', interval: 600}"; echo "rules: [MATCH,T]"; } > c.yaml
+            echo "proxy-groups:"; echo "  - {name: T, type: url-test, use: [m], url: 'https://www.gstatic.com/generate_204', interval: 600}"; echo 'rules: ["MATCH,T"]'; } > c.yaml
           ./mihomo -d . -f c.yaml > m.log 2>&1 & MP=$!; sleep 15
           c=$(curl -s -x http://127.0.0.1:17897 -o /dev/null -w '%{http_code}' --max-time 20 https://www.gstatic.com/generate_204); [ "$c" = 204 ] && ok "代理连通 generate_204" || bad "代理连通 $c"
           c=$(curl -s -x http://127.0.0.1:17897 --max-time 20 https://www.cloudflare.com/cdn-cgi/trace | grep -c '^loc=' || true); [ "$c" = 1 ] && ok "CF 站点经代理" || bad "CF 站点经代理"
