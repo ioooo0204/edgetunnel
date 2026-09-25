@@ -1,12 +1,18 @@
 name: Obfuscate and Deploy
-# 套壳流水线：上游同步(main) → 混淆 _worker.js → 推到 deploy 分支 → Cloudflare 自动构建
+# 套壳流水线：上游同步(main) → 混淆 _worker.js → 推到 deploy 分支（含本项目专用 wrangler.toml）
+# 2026-09-25 调整：
+#   1) 混淆减负：去掉控制流扁平化/死代码注入（免费版 Worker 每请求只有 10ms CPU，重混淆会拖慢），
+#      保留标识符重命名 + base64 字符串数组，关键字（vless/edgetunnel 等）照样不会明文出现
+#   2) deploy 分支写入 edt2-worker 专用 wrangler.toml（名称 + KV 绑定 + keep_vars），
+#      否则用 Cloudflare Git 自动构建时会因名称不符失败或丢失 KV
+#   3) 混淆后先 node --check 语法校验，坏产物不推送
 permissions:
   contents: write
 
 on:
   workflow_dispatch:
   schedule:
-    - cron: "30 0 * * *"   # 每天 00:30 UTC，晚于上游 sync.yml 的 00:00，接力处理
+    - cron: "30 0 * * *"   # 每天 00:30 UTC，晚于上游 sync.yml 的 00:00
   push:
     branches: [main]
 
@@ -30,28 +36,41 @@ jobs:
       - name: Install javascript-obfuscator
         run: npm install -g javascript-obfuscator --silent
 
-      - name: Obfuscate _worker.js
+      - name: Obfuscate _worker.js (light)
         run: |
-          # 中等强度混淆：控制流扁平化 + 字符串数组化 + 死代码注入
-          # 不开 selfDefending / debugProtection，避免影响 Workers 运行时性能
           npx javascript-obfuscator _worker.js \
             --output _worker.js \
             --compact true \
-            --control-flow-flattening true \
-            --control-flow-flattening-threshold 0.75 \
+            --control-flow-flattening false \
+            --dead-code-injection false \
+            --identifier-names-generator hexadecimal \
+            --rename-globals false \
             --string-array true \
-            --string-array-encoding rc4 \
+            --string-array-encoding base64 \
             --string-array-threshold 1 \
             --string-array-rotate true \
             --string-array-shuffle true \
-            --split-strings true \
-            --split-strings-chunk-length 8 \
-            --dead-code-injection true \
-            --dead-code-injection-threshold 0.4 \
-            --rename-globals false \
+            --split-strings false \
             --self-defending false \
             --debug-protection false \
             --source-map false
+          node --check _worker.js
+          ls -l _worker.js
+
+      - name: Write project wrangler.toml
+        run: |
+          cat > wrangler.toml <<'TOML'
+          name = "edt2-worker"
+          main = "_worker.js"
+          compatibility_date = "2025-11-04"
+          keep_vars = true
+
+          [[kv_namespaces]]
+          binding = "KV"
+          id = "85d7a91db50f4e75b426256607e01da6"
+          TOML
+          sed -i 's/^          //' wrangler.toml
+          cat wrangler.toml
 
       - name: Prepare deploy branch
         run: |
